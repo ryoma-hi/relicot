@@ -1,0 +1,89 @@
+# --- Python 基本 ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+*.manifest
+*.spec
+
+# --- 仮想環境 / ツール ---
+.venv/
+venv/
+.env
+.env.*           # 環境変数ファイル
+.python-version
+pip-wheel-metadata/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+*.ipynb_convert/
+.profile
+.DS_Store
+
+# --- ログ/出力/キャッシュ ---
+logs/
+log/
+tmp/
+temp/
+outputs/
+output/
+cache/
+.cache/
+wandb/
+mlruns/
+lightning_logs/
+tensorboard/
+.prof/
+
+# --- 学習/推論アセット（再生成可能 or 再配布微妙なもの）---
+checkpoints/
+checkpoints-*/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.tflite
+*.npz
+*.npy
+*.h5
+
+# --- データ置き場（公開したくない場合）---
+data/
+data_raw/
+datasets/
+private/
+secrets/
+*.sqlite3
+*.db
+
+# --- Hugging Face / LLM 関連キャッシュ ---
+.huggingface/
+huggingface/
+~/.cache/huggingface/
+~/.cache/torch/
+~/.cache/clip/
+~/.cache/
+
+# --- IDE / OS ごみ ---
+.vscode/
+.vscode/*
+!.vscode/settings.json
+.idea/
+*.iml
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# --- Git ---
+*.orig
+*.rej
+
+# --- 生成済みドキュメント ---
+site/
+docs/_build/
