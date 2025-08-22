@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relicot"
+version = "0.1.0"
+description = "Reasoning (CoT) and Uncertainty (CoT-UQ) toolkit"
+authors = [{ name = "Your Name" }]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.22"
+  # torch/transformers は重いのでオプション扱いにします（下の optional-dependencies を参照）
+]
+
+[project.optional-dependencies]
+hf = ["transformers>=4.44", "accelerate>=0.30", "torch>=2.1"]
+dev = ["black>=24.3", "isort>=5.13", "mypy>=1.8", "pytest>=8.2"]
+
+[tool.setuptools]
+packages = { find = { where = ["."] } }
+
+# プロンプトtxtをパッケージ同梱
+[tool.setuptools.package-data]
+"relicot.CoT" = ["prompts/*.txt"]
+"relicot.UQ"  = ["prompts/*.txt"]
+
+# お好みで
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+known_first_party = ["relicot"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+strict_optional = true
+warn_unused_ignores = true

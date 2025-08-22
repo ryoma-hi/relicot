@@ -1,0 +1,6 @@
+Question: {question}
+Possible answer: {answer}
+{added_info}
+Q: Considering this additional information, how likely is the above answer to be correct?
+Please respond with only one word: True or False.
+The student's answer is:

@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 from relicot.CoT.cot_module import CoTGenerator
 from relicot.CoT.cot_parser import parse_all
+from . import prompts as uq_prompts
 
 
 # -----------------------------
@@ -72,24 +73,7 @@ class HFCausalLogProbScorer:
 # -----------------------------
 # Stage 1: prompts & parsing
 # -----------------------------
-PROMPT_KEYWORDS_AND_SCORES = """次の質問と、多段の推論過程（Step i）が与えられます。
-各 Step i について、そのステップに固有のキーワードのみを日本語で抽出し、
-各キーワードの重要度スコア(1..10, 10=最重要)を付与してください。
-出力は**日本語のみ**、**以下の形式のみ**で、余計な文を絶対に書かないでください。
 
-出力形式（例）:
-Step 1: キーワードA (/8/); キーワードB (/5/)
-Step 2: NO ANSWER
-Step 3: キーワードC (/10/)
-
-質問:
-{question}
-
-推論過程:
-{multistep}
-
-Keywords for Each Reasoning Step:
-"""
 
 _step_line = re.compile(r"(?mi)^\s*Step\s*(\d+)\s*:\s*(.+)$")
 _JA_TOKEN = r"[ぁ-んァ-ヶ一-龥A-Za-z0-9％%．\.\-\/\(\)（）：: ]"
@@ -270,22 +254,12 @@ def build_se_context(
 
 
 def p_true_with_context(
-    scorer: HFCausalLogProbScorer,
-    question: str,
-    answer: str,
-    added_info: str,
+    scorer: HFCausalLogProbScorer, question: str, answer: str, added_info: str
 ) -> float:
-    """
-    P(True) テンプレート（Appendix B.2 の Self-Probing 形式に倣う簡易版）。
-    次トークンの2候補 ' True' / ' False' の確率で近似。
-    """
-    prompt = (
-        "Question: " + question + "\n"
-        "Possible answer: " + answer + "\n"
-        + added_info + "\n"
-        "Q: Considering this additional information, how likely is the above answer to be correct?\n"
-        "Please respond with only one word: True or False.\n"
-        "The student's answer is:"
+    """True/False自己評価（テンプレは外部ファイル）。"""
+    prompt = uq_prompts.render(
+        "se_true_false_probe_ja",
+        vars={"question": question, "answer": answer, "added_info": added_info},
     )
     return scorer.binary_choice_prob(prompt, opt_true=" True", opt_false=" False")
 
@@ -311,6 +285,8 @@ def run_cotuq(
     tokenizer=None,
     # Stage 1
     template_reason: str = "cot_default_ja",
+    template_kw: str = "kw_extract_ja",
+    template_se_probe: str = "se_true_false_probe_ja",
     # Stage 2 (AP)
     scorer: Optional[HFCausalLogProbScorer] = None,
     ap_use: bool = True,
@@ -338,8 +314,9 @@ def run_cotuq(
 
     # ---- Stage 1: keywords+scores
     print("[Stage1] Extracting keywords+scores...")
-    kw_prompt = PROMPT_KEYWORDS_AND_SCORES.format(
-        question=question, multistep=steps_text + f"\nFinal Answer: {answer}"
+    kw_prompt = uq_prompts.render(
+        template_kw,
+        vars={"question": question, "multistep": steps_text + f"\nFinal Answer: {answer}"}
     )
     kw_text = gen.generate_fn(
         kw_prompt,
@@ -383,6 +360,7 @@ def run_cotuq(
                 mode=mode,
                 tau=se_tau,
             )
+            # テンプレ名を使い回す場合は p_true_with_context 内はそのままでOK
             ptrue = p_true_with_context(scorer, question, answer, added)
             se_confs[mode] = ptrue
             print(f"done. P(True)={ptrue:.4f}")

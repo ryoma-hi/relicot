@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Lightweight evaluation utilities for CoT outputs.
+Lightweight evaluation utilities for CoT outputs (clean ver.).
 
 Covers:
 - Answer correctness: exact/normalized/numeric/regex/MCQ
 - Heuristics for CoT steps: count/length/redundancy
 - Self-consistency aggregation: vote share & entropy
-- Calibration metrics (optional): ECE, Brier (needs confidences)
-
-No external deps. Keep it simple & fast.
+- Calibration metrics: ECE, Brier (needs confidences)
 """
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Iterable, Tuple
+from collections import Counter
 import math
 import re
 import statistics
@@ -25,12 +24,13 @@ WHITESPACE_RE = re.compile(r"\s+")
 def normalize_text(s: str) -> str:
     if s is None:
         return ""
-    s = s.strip()
-    s = s.replace("\u3000", " ")  # 全角スペース
+    s = s.strip().replace("\u3000", " ")
     s = WHITESPACE_RE.sub(" ", s)
-    # 末尾句点のゆらぎ吸収（日本語タスク向け）
-    s = s.rstrip("。.")
-    return s
+    return s.rstrip("。.")
+
+def _nz(s: Optional[str]) -> str:
+    """None → '' の薄い補助。"""
+    return s or ""
 
 def only_digits_and_sign(s: str) -> str:
     return re.sub(r"[^0-9\.\-\+eE]", "", s or "")
@@ -55,7 +55,7 @@ def extract_first_number(s: str) -> Optional[float]:
 # Core correctness checks
 # -------------------------
 def exact_match(pred: str, gold: str) -> bool:
-    return (pred or "") == (gold or "")
+    return _nz(pred) == _nz(gold)
 
 def normalized_match(pred: str, gold: str) -> bool:
     return normalize_text(pred) == normalize_text(gold)
@@ -63,7 +63,7 @@ def normalized_match(pred: str, gold: str) -> bool:
 def regex_match(pred: str, pattern: str) -> bool:
     """pattern: Python regex that should match pred."""
     try:
-        return re.search(pattern, pred or "") is not None
+        return re.search(pattern, _nz(pred)) is not None
     except re.error:
         return False
 
@@ -83,18 +83,17 @@ def numeric_close(
         return True
     if rtol > 0 and g != 0 and abs(p - g) <= rtol * abs(g):
         return True
-    return p == g  # exact float string equality fallback
+    return p == g  # fallback
 
 def mcq_match(pred: str, correct_option: str) -> bool:
     """
     多肢選択の判定。
-    例: correct_option='C'、predが 'Answer: C' / 'C) ...' / '選択肢C' 等でも拾いたい。
+    例: correct_option='C'、predが 'Answer: C' / 'C) ...' / '選択肢C' 等でも拾う。
     """
     if not pred:
         return False
     p = normalize_text(pred).upper()
     c = normalize_text(correct_option).upper()
-    # 代表的表現の吸収
     patterns = [
         rf"\b{re.escape(c)}\b",
         rf"ANSWER\s*[:：]\s*{re.escape(c)}",
@@ -118,17 +117,19 @@ class StepStats:
 def compute_step_stats(steps: List[str]) -> StepStats:
     if not steps:
         return StepStats(0, 0.0, 0, 0.0, 1.0)
-    lens = [len(s.strip()) for s in steps]
-    n = len(steps)
-    mean_len = statistics.mean(lens)
-    max_len = max(lens)
-    # 重複率
-    uniq = set(s.strip() for s in steps if s.strip())
-    redundancy = 1.0 - (len(uniq) / n) if n > 0 else 0.0
-    # 短すぎる（<=3文字）を空扱い
-    empty = sum(1 for s in steps if len(s.strip()) <= 3) / n
-    return StepStats(n_steps=n, mean_len=mean_len, max_len=max_len,
-                     redundancy_ratio=redundancy, empty_ratio=empty)
+    cleaned = [s.strip() for s in steps]
+    lens = [len(s) for s in cleaned]
+    n = len(cleaned)
+    uniq = set(s for s in cleaned if s)
+    redundancy = 1.0 - (len(uniq) / n)
+    empty = sum(1 for s in cleaned if len(s) <= 3) / n
+    return StepStats(
+        n_steps=n,
+        mean_len=statistics.mean(lens),
+        max_len=max(lens),
+        redundancy_ratio=redundancy,
+        empty_ratio=empty,
+    )
 
 # -------------------------
 # Keyword recall (optional)
@@ -137,19 +138,12 @@ def keyword_recall(pred_text: str, required_keywords: Iterable[str]) -> float:
     """
     CoT中に含んでほしい語（根拠キーワード）の再現率をざっくり測る。
     """
-    if not required_keywords:
+    kws = [kw.strip() for kw in (required_keywords or []) if kw and kw.strip()]
+    if not kws:
         return 1.0
     p = normalize_text(pred_text)
-    total = 0
-    hit = 0
-    for kw in required_keywords:
-        kw = kw.strip()
-        if not kw:
-            continue
-        total += 1
-        if kw in p:
-            hit += 1
-    return hit / total if total else 1.0
+    hit = sum(1 for kw in kws if kw in p)
+    return hit / len(kws)
 
 # -------------------------
 # Self-consistency aggregation
@@ -158,56 +152,46 @@ def vote_share(answers: List[Optional[str]]) -> Dict[str, float]:
     """
     それぞれの答えの票割合を返す。None は除外。
     """
-    counts: Dict[str, int] = {}
-    for a in answers:
-        if a is None:
-            continue
-        counts[a] = counts.get(a, 0) + 1
-    total = sum(counts.values())
-    if total == 0:
-        return {}
-    return {k: v / total for k, v in counts.items()}
+    cnt = Counter(a for a in answers if a is not None)
+    total = sum(cnt.values())
+    return {k: v / total for k, v in cnt.items()} if total else {}
 
 def entropy_from_share(share: Dict[str, float]) -> float:
     """自己一貫性サンプルの不確実性（エントロピー, bits）。"""
     if not share:
         return 0.0
-    return -sum(p * math.log(p, 2) for p in share.values())
+    return -sum(p * math.log2(p) for p in share.values())
 
 # -------------------------
 # Calibration metrics (optional)
 # -------------------------
 def brier_score(prob_correct: float, is_correct: bool) -> float:
-    """
-    2値Brier。予測確信度（0..1）と正誤で評価。
-    """
+    """2値Brier。予測確信度（0..1）と正誤で評価。"""
     y = 1.0 if is_correct else 0.0
     return (prob_correct - y) ** 2
 
 def expected_calibration_error(
     confidences: List[float], corrects: List[bool], n_bins: int = 10
 ) -> float:
-    """
-    ECE（ナイーブ実装）。confidences: [0..1]
-    """
+    """ECE（ナイーブ実装）。confidences: [0..1]"""
     assert len(confidences) == len(corrects)
     if not confidences:
         return 0.0
-    bins = [[] for _ in range(n_bins)]
+
+    bins: List[List[Tuple[float, float]]] = [[] for _ in range(n_bins)]
     for c, y in zip(confidences, corrects):
         c = min(max(c, 0.0), 1.0)
-        # 1.0 は最後のビンへ
-        idx = min(int(c * n_bins), n_bins - 1)
+        idx = min(int(c * n_bins), n_bins - 1)  # c==1.0 は最後のビンへ
         bins[idx].append((c, 1.0 if y else 0.0))
+
     ece = 0.0
     n = len(confidences)
-    for i, bucket in enumerate(bins):
+    for bucket in bins:
         if not bucket:
             continue
         avg_conf = sum(c for c, _ in bucket) / len(bucket)
         acc = sum(y for _, y in bucket) / len(bucket)
-        weight = len(bucket) / n
-        ece += weight * abs(avg_conf - acc)
+        ece += (len(bucket) / n) * abs(avg_conf - acc)
     return ece
 
 # -------------------------
@@ -240,40 +224,32 @@ def evaluate_single(
     汎用の単一サンプル評価。
     ゴールドの種類（MCQ/正規表現/数値/文字列）を自動で優先判定。
     """
-    # Step stats
     sstats = compute_step_stats(steps)
+    pa = _nz(pred_answer)
 
     # 判定順序：MCQ > regex > numeric > normalized string
     if item.mcq_correct:
-        ok = mcq_match(pred_answer or "", item.mcq_correct)
-        return EvalResult(correct=ok, reason="mcq", step_stats=sstats,
-                          metrics={"match": ok})
+        ok = mcq_match(pa, item.mcq_correct)
+        return EvalResult(ok, "mcq", sstats, {"match": ok})
 
     if item.gold_regex:
-        ok = regex_match(pred_answer or "", item.gold_regex)
-        return EvalResult(correct=ok, reason="regex", step_stats=sstats,
-                          metrics={"match": ok})
+        ok = regex_match(pa, item.gold_regex)
+        return EvalResult(ok, "regex", sstats, {"match": ok})
 
     if item.gold_numeric:
-        comp = numeric_close(pred_answer or "", item.gold or "",
-                             atol=numeric_atol, rtol=numeric_rtol)
-        return EvalResult(correct=comp, reason="numeric", step_stats=sstats,
-                          metrics={"close": comp, "atol": numeric_atol, "rtol": numeric_rtol})
+        comp = numeric_close(pa, _nz(item.gold), atol=numeric_atol, rtol=numeric_rtol)
+        return EvalResult(comp, "numeric", sstats, {"close": comp, "atol": numeric_atol, "rtol": numeric_rtol})
 
     if item.gold is not None:
-        ok = normalized_match(pred_answer or "", item.gold or "")
-        return EvalResult(correct=ok, reason="normalized", step_stats=sstats,
-                          metrics={"match": ok})
+        ok = normalized_match(pa, _nz(item.gold))
+        return EvalResult(ok, "normalized", sstats, {"match": ok})
 
     # ゴールドなし：キーワード再現だけ見る
     if item.required_keywords:
-        rec = keyword_recall("\n".join(steps) + "\n" + (pred_answer or ""),
-                             item.required_keywords)
-        return EvalResult(correct=None, reason="keywords_only", step_stats=sstats,
-                          metrics={"keyword_recall": rec})
+        rec = keyword_recall("\n".join(steps) + "\n" + pa, item.required_keywords)
+        return EvalResult(None, "keywords_only", sstats, {"keyword_recall": rec})
 
-    # 何も比較できない
-    return EvalResult(correct=None, reason="no_gold", step_stats=sstats, metrics={})
+    return EvalResult(None, "no_gold", sstats, {})
 
 def evaluate_self_consistency(
     answers: List[Optional[str]],
@@ -287,7 +263,8 @@ def evaluate_self_consistency(
     top_answer = max(share.items(), key=lambda x: x[1])[0] if share else None
     acc = None
     if gold is not None and answers:
-        acc = sum(1 for a in answers if normalize_text(a) == normalize_text(gold)) / len(answers)
+        g = normalize_text(gold)
+        acc = sum(1 for a in answers if normalize_text(a) == g) / len(answers)
     return {"vote_share": share, "entropy": ent, "top_answer": top_answer, "sample_acc": acc}
 
 # -------------------------
@@ -303,18 +280,14 @@ def evaluate_batch(
     一括評価。戻り値は集計と各サンプル詳細。
     """
     assert len(preds) == len(items)
-    results: List[EvalResult] = []
-    for (ans, steps), it in zip(preds, items):
-        res = evaluate_single(ans, steps, it, numeric_atol, numeric_rtol)
-        results.append(res)
+    results: List[EvalResult] = [
+        evaluate_single(ans, steps, it, numeric_atol, numeric_rtol)
+        for (ans, steps), it in zip(preds, items)
+    ]
 
-    # 集計（correct が True/False のものだけ）
     judged = [r for r in results if isinstance(r.correct, bool)]
-    acc = sum(1 for r in judged if r.correct) / len(judged) if judged else None
-
-    # ステップ統計の要約
-    n_steps = [r.step_stats.n_steps for r in results]
-    mean_steps = statistics.mean(n_steps) if n_steps else 0.0
+    acc = (sum(1 for r in judged if r.correct) / len(judged)) if judged else None
+    mean_steps = statistics.mean([r.step_stats.n_steps for r in results]) if results else 0.0
 
     return {
         "accuracy": acc,
@@ -323,3 +296,77 @@ def evaluate_batch(
         "n_judged": len(judged),
         "details": results,
     }
+
+
+# --- Generic extractors ------------------------------------------------------
+from typing import Protocol, Tuple, Any
+
+class EvalExtractor(Protocol):
+    def __call__(self, pred: Any) -> Tuple[Optional[str], List[str]]: ...
+
+def default_extractor(pred: Any) -> Tuple[Optional[str], List[str]]:
+    """dict / dataclass / 任意オブジェクトから (answer, steps) を素直に取り出す。"""
+    # dict っぽい
+    if isinstance(pred, dict):
+        ans = pred.get("answer")
+        steps = pred.get("steps") or []
+        # もし steps が [[...], ...] なら最初だけ拾う（SCの steps_list などを想定）
+        if steps and isinstance(steps[0], list):
+            steps = steps[0]
+        return ans, steps
+    # 属性アクセス（dataclass想定）
+    ans = getattr(pred, "answer", None)
+    steps = getattr(pred, "steps", []) or []
+    return ans, steps
+
+def evaluate_generic_batch(
+    preds: List[Any],
+    items: List[EvalItem],
+    extractor: EvalExtractor = default_extractor,
+    numeric_atol: float = 0.0,
+    numeric_rtol: float = 0.0,
+) -> Dict[str, Any]:
+    """どんなモジュールの出力でも、extractor で (answer, steps) に正規化して評価。"""
+    assert len(preds) == len(items)
+    normed = [extractor(p) for p in preds]
+    return evaluate_batch(normed, items, numeric_atol=numeric_atol, numeric_rtol=numeric_rtol)
+
+# --- Self-consistency (SC) の汎用集計（answers を持っていれば評価） ----------
+def extract_sc_answers(pred: Any) -> List[Optional[str]]:
+    """pred が {'answers': [...]} や .answers を持っていれば取り出す。無ければ []。"""
+    if isinstance(pred, dict):
+        a = pred.get("answers")
+        return a if isinstance(a, list) else []
+    return getattr(pred, "answers", []) or []
+
+def evaluate_sc_generic(pred: Any, gold: Optional[str] = None) -> Dict[str, Any]:
+    answers = extract_sc_answers(pred)
+    return evaluate_self_consistency(answers, gold=gold)
+
+# --- Confidence signals & combiner ------------------------------------------
+from dataclasses import dataclass
+
+@dataclass
+class ConfidenceSignals:
+    sc_vote_share_max: Optional[float] = None   # SCの最大得票率 [0..1]
+    ap_conf: Optional[float] = None             # UQ(AP) 由来 [0..1]
+    se_conf: Optional[float] = None             # UQ(SE) 由来 [0..1]
+
+@dataclass
+class ConfidencePolicy:
+    w_sc: float = 0.55
+    w_se: float = 0.25
+    w_ap: float = 0.20
+    clamp_min: float = 0.0
+    clamp_max: float = 1.0
+
+def confidence_from_vote_share(share: Dict[str, float]) -> float:
+    return max(share.values()) if share else 0.0
+
+def combine_confidence(sig: ConfidenceSignals, pol: ConfidencePolicy = ConfidencePolicy()) -> float:
+    val = 0.0
+    if sig.sc_vote_share_max is not None: val += pol.w_sc * sig.sc_vote_share_max
+    if sig.se_conf is not None:           val += pol.w_se * sig.se_conf
+    if sig.ap_conf is not None:           val += pol.w_ap * sig.ap_conf
+    return max(pol.clamp_min, min(pol.clamp_max, val))
+

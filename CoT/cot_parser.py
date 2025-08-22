@@ -1,40 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-多様な書式のCoTを安定して構造化
+多様な書式のCoTを安定して構造化（clean ver.）
 
-ルール：
-
-Step検出:Step n: / 1. / - の3系統に対応(正規表現)
-
-Answer検出:Answer: / A: / 結論: / 最終解: に対応
-
-フォールバック：見出しが無い場合の行スキャン（上限あり）
-
-付加機能：
-
-normalize_whitespace() と連携して整形
-
-CoTParseResult で型付き返却
-
-想定用途:自動評価・ログ収集・後工程(UQ/集計)に流す前処理
-
-- parse_steps(text) -> list[str]
-- extract_answer(text) -> str|None
-- parse_all(text) -> {"steps": [...], "answer": "...", "raw": text}
+- parse_steps(text) -> List[str]
+- extract_answer(text) -> Optional[str]
+- parse_all(text) -> CoTParseResult
 """
 from __future__ import annotations
-import re
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
+import re
 
 from .cot_utils import normalize_whitespace
 
+# 既存の正規表現パターン（順序で優先度が決まる）
 STEP_PATTERNS = [
     r"(?mi)^\s*Step\s*\d+\s*:\s*(.+)$",
     r"(?mi)^\s*\d+\.\s*(.+)$",
     r"(?mi)^\s*-\s*(.+)$",
 ]
-
 ANSWER_PATTERNS = [
     r"(?mi)^\s*Answer\s*:\s*(.+)$",
     r"(?mi)^\s*A\s*:\s*(.+)$",
@@ -42,42 +26,63 @@ ANSWER_PATTERNS = [
     r"(?mi)^\s*最終解\s*[:：]\s*(.+)$",
 ]
 
+# フォールバック時に「ここで打ち切る」ための見出し検出
+ANSWER_HEAD_RE = re.compile(r"(?mi)^\s*(Answer|A|結論|最終解)\s*[:：]")
+FALLBACK_MAX_LINES = 10
+
+
 @dataclass
 class CoTParseResult:
     steps: List[str]
     answer: Optional[str]
     raw: str
 
-def _match_first(text: str, patterns: List[str]) -> Optional[str]:
+
+# ---- helpers ---------------------------------------------------------------
+def _match_first_group(text: str, patterns: List[str]) -> Optional[str]:
+    """パターン群のどれかに最初にマッチしたグループ1を返す。"""
     for pat in patterns:
         m = re.search(pat, text)
         if m:
             return normalize_whitespace(m.group(1))
     return None
 
-def parse_steps(text: str) -> List[str]:
-    steps: List[str] = []
+
+def _find_steps_by_patterns(text: str) -> List[str]:
+    """STEP_PATTERNSのいずれかで抽出（最初にヒットした規則だけ採用）。"""
     for pat in STEP_PATTERNS:
-        ms = re.findall(pat, text)
-        if ms:
-            steps = [normalize_whitespace(x) for x in ms if normalize_whitespace(x)]
+        matches = re.findall(pat, text)
+        if matches:
+            # 正規化して空要素を除去
+            steps = [normalize_whitespace(s) for s in matches]
+            return [s for s in steps if s]
+    return []
+
+
+def _fallback_lines_until_answer(text: str) -> List[str]:
+    """見出しが無い場合、Answer見出しまで（最大FALLBACK_MAX_LINES）を行で返す。"""
+    steps: List[str] = []
+    for line in text.splitlines():
+        line_norm = normalize_whitespace(line)
+        if not line_norm:
+            continue
+        if ANSWER_HEAD_RE.match(line_norm):
             break
-    # Fallback: split by lines if no explicit step markers
-    if not steps:
-        lines = [normalize_whitespace(l) for l in text.splitlines()]
-        lines = [l for l in lines if l]
-        # Heuristic: keep lines until we hit 'Answer:'
-        acc = []
-        for l in lines:
-            if re.match(r"(?mi)^\s*(Answer|A|結論|最終解)\s*[:：]", l):
-                break
-            acc.append(l)
-        # Avoid dumping all if it's too long
-        steps = acc[:10]  # cap to 10 lines
+        steps.append(line_norm)
+        if len(steps) >= FALLBACK_MAX_LINES:
+            break
     return steps
 
+
+# ---- public APIs -----------------------------------------------------------
+def parse_steps(text: str) -> List[str]:
+    steps = _find_steps_by_patterns(text)
+    return steps if steps else _fallback_lines_until_answer(text)
+
+
 def extract_answer(text: str) -> Optional[str]:
-    return _match_first(text, ANSWER_PATTERNS)
+    return _match_first_group(text, ANSWER_PATTERNS)
+
 
 def parse_all(text: str) -> CoTParseResult:
     return CoTParseResult(
