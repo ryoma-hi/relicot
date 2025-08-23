@@ -8,6 +8,9 @@ CoT-UQ (Zhang & Zhang, 2025) を、既存の CoT モジュール上で動かす�
 - relicot.CoT.cot_module.CoTGenerator (generate_fn を外から注入)
 - HFモデルを用いた対数確率計算 (HFCausalLogProbScorer; 本ファイル内)
 """
+
+
+
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
@@ -21,6 +24,27 @@ from relicot.CoT.cot_module import CoTGenerator
 from relicot.CoT.cot_parser import parse_all
 from . import prompts as uq_prompts
 
+# --- 追加（ファイル上部の import の下あたり） ---
+_ZEN2HAN = str.maketrans({
+    "（":"(", "）":")", "：":":", "；":";", "　":" ",
+    "，":",", "、":",", "／":"/",
+    "０":"0","１":"1","２":"2","３":"3","４":"4","５":"5","６":"6","７":"7","８":"8","９":"9",
+})
+def _norm(s: str) -> str:
+    s = s.translate(_ZEN2HAN)
+    s = re.sub(r"[ \t]+", " ", s).strip()
+    return s
+    
+_STEP_LINE = re.compile(r"(?mi)^\s*(?:Step|ステップ)\s*0*(\d+)\s*[:\-]\s*(.+)$")
+# スコア表記のゆるい検出: (/8/) | (8) | 重要度8 | /8/
+_SCORE_PATTS = [
+    re.compile(r"\(\s*/\s*(\d+)\s*/\s*\)"),
+    re.compile(r"\(\s*(\d+)\s*\)"),
+    re.compile(r"(?:重要度|score)\s*[:：]?\s*(\d+)"),
+    re.compile(r"/\s*(\d+)\s*/"),
+]
+# 候補分割子: ; , / 複空白
+_SEG_SPLIT = re.compile(r"[;,/]|(?:\s{2,})")
 
 # -----------------------------
 # HF causal LM logprob scorer
@@ -91,32 +115,40 @@ def _clean_kw(s: str) -> str:
     return s
 
 def parse_keywords_block(text: str) -> Dict[int, List[Tuple[str, int]]]:
+    text = _norm(text)
     out: Dict[int, List[Tuple[str, int]]] = {}
-    for m in _step_line.finditer(text):
+    # 1行内に Step 2: ... Step 3: ... と連結しても finditer で拾える
+    for m in _STEP_LINE.finditer(text):
         idx = int(m.group(1))
-        rest = m.group(2).strip()
-        if re.search(r"NO\s*ANSWER", rest, re.I):
+        rest = _norm(m.group(2))
+        if re.search(r"\bNO\s*ANSWER\b", rest, re.I):
             out[idx] = []
             continue
         pairs: List[Tuple[str, int]] = []
-        # セミコロン区切りで「キーワード (/N/)」を抽出
-        for seg in [s.strip() for s in rest.split(";") if s.strip()]:
-            m2 = re.match(r"^(.*?)[\s　]*\(\s*/\s*(\d+)\s*/\s*\)\s*$", seg)
-            if not m2:
+        for seg in [s.strip() for s in _SEG_SPLIT.split(rest) if s.strip()]:
+            sc = None
+            for sp in _SCORE_PATTS:
+                sm = sp.search(seg)
+                if sm:
+                    sc = int(sm.group(1))
+                    seg = sp.sub("", seg).strip()
+                    break
+            # スコアが無ければスキップ（または既定値で受けたいなら sc = 7）
+            if not seg or sc is None:
                 continue
-            kw = _clean_kw(m2.group(1))
-            if not kw:
+            # 軽いノイズ除去（説明文を除外）
+            if len(seg) > 30: 
                 continue
-            sc = int(m2.group(2))
-            sc = max(1, min(10, sc))  # 1..10に丸め
-            pairs.append((kw, sc))
-        # 重複をスコア最大でマージ
+            seg = re.sub(r"^[\-\•\・\s]+|[\-\•\・\s]+$", "", seg)
+            if not seg:
+                continue
+            pairs.append((seg, max(1, min(10, sc))))
+        # 重複マージ（最大スコア優先）
         merged: Dict[str, int] = {}
         for k, t in pairs:
             merged[k] = max(merged.get(k, 0), t)
-        out[idx] = sorted(merged.items(), key=lambda x: x[1], reverse=True)[:5]  # 各Step上位5まで
+        out[idx] = sorted(merged.items(), key=lambda x: x[1], reverse=True)[:5]
     return out
-
 # -----------------------------
 # Stage 2: AP 強化 (式5,6)
 # -----------------------------
@@ -130,7 +162,7 @@ def aggregate_keyword_prob(
     式(5): p(w^) = Aggr_m P(w_m | p, w_<m)
     ここでは continuation を keyword として seq_logprob を取り、平均/最小で集約。
     """
-    res = scorer.seq_logprob(base_prompt, keyword)
+    res = scorer.seq_logprob(base_prompt, " " + keyword + "\n")
     if res.n_tokens == 0:
         return 0.0
     if agg == "mean":
@@ -320,11 +352,17 @@ def run_cotuq(
     )
     kw_text = gen.generate_fn(
         kw_prompt,
-        max_new_tokens=256,
-        temperature=0.2,
-        top_p=0.9,
-        stop=["\n\nQuestion:", "\nQ:", "\n問題:"],
+        max_new_tokens=200,
+        do_sample=False,      # ← 乱数なし（温度0）
+        temperature=0.0,
+        top_p=1.0,
+        stop=[
+            "\nHuman:", "\nAssistant:", "\n\nQuestion:", "\nQ:", "\n問題:", "\n推論過程:",
+            "\nKeywords for Each Reasoning Step:",  # 再出力を遮断
+            " How",                                  # 英語尻尾を遮断
+        ],
     )
+
     kw_by_step = parse_keywords_block(kw_text)
     print("[Stage1] Keywords extracted:")
     for step_id, kws in kw_by_step.items():
@@ -337,10 +375,9 @@ def run_cotuq(
         print("[Stage2] Computing AP (answer probability weighted by keywords)...")
         ap_out = confidence_ap_weighted(
             scorer=scorer,
-            base_prompt="Question: " + question + "\n",
+            base_prompt=f"Question: {question}\nKeywords:",   # ← ここ
             kw_by_step=kw_by_step,
-            agg=ap_agg,
-            tau=ap_tau,
+            agg=ap_agg, tau=ap_tau,
         )
         ap_conf = ap_out["confidence"]
         ap_detail = ap_out
