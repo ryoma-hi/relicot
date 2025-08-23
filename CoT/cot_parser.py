@@ -14,7 +14,6 @@ import re
 from .cot_utils import normalize_whitespace
 
 # 既存の正規表現パターン（順序で優先度が決まる）
-
 STEP_PATTERNS = [
     r"(?mi)^\s*Step\s*\d+\s*[:：]\s*(.+)$",
     r"(?mi)^\s*ステップ\s*\d+\s*[:：]\s*(.+)$",  # ← 日本語も許容
@@ -29,6 +28,7 @@ ANSWER_PATTERNS = [
     r"(?mi)^\s*結論\s*[:：]\s*(.+)$",
     r"(?mi)^\s*最終(?:解|解答|回答)\s*[:：]\s*(.+)$",  # ← 追加
 ]
+
 
 # フォールバック時に「ここで打ち切る」ための見出し検出
 ANSWER_HEAD_RE = re.compile(r"(?mi)^\s*(Answer|A|結論|最終解)\s*[:：]")

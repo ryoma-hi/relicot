@@ -1,80 +1,61 @@
-# halusearch/prompts.py
 # -*- coding: utf-8 -*-
-from __future__ import annotations
-from typing import Optional, Mapping, List
-from importlib import resources
+"""
+HaluSearch（LLM-only簡易版）用のプロンプト群
+- cot_expand_ja : 次の一手を k 個、箇条書きで提案
+- cot_judge_ja  : 現在の思考枝と暫定答えの妥当性を 0..1 の score で単行出力
+"""
 
-# ---- 1) 共通PromptStoreがあれば使う（無ければローカル実装へ） -----------------
-_PS = None
-try:
-    # 例: relicot/common/prompt_store.py
-    from ..common.prompt_store import PromptStore as _PS  # type: ignore
-except Exception:
-    try:
-        # 例: relicot/common/prompts.py （ファイル名違いにも対応）
-        from ..common.prompts import PromptStore as _PS  # type: ignore
-    except Exception:
-        _PS = None  # フォールバックへ
+HALUSEARCH_TEMPLATES = {
+    "cot_expand_ja": """あなたは段階的推論の戦略立案者です。
+問題と、ここまでの推論ステップを与えます。次に進める「具体的な一手」（1文）を {k} 個だけ提案してください。
 
-# ---- 2) ローカルStore（最小実装） -------------------------------------------
-if _PS is None:
-    class _LocalStore:
-        """
-        prompts/<name>.txt を importlib.resources で読み込み、str.format で埋め込むだけの軽実装。
-        - strict=True: 不足キーがあれば KeyError
-        - strict=False: 不足キーは空文字に
-        - サブディレクトリは 'prompts' → 無ければ 'prompt' を探す
-        """
-        def __init__(self, package: str, subdir: str = "prompts", alt_subdir: str = "prompt"):
-            self.package = package
-            self.subdir = subdir
-            self.alt_subdir = alt_subdir
+# ルール
+- 各案は1行・1文・冗長説明なし
+- 新規事実の捏造はしない。未知の場合は「外部情報で検証する」等のアクション記述も可
+- 出力は**箇条書き {k} 行のみ**（先頭に "- " を付ける）。余計な文や空行は禁止。
 
-        def _load_text(self, name: str) -> str:
-            last_err = None
-            for d in (self.subdir, self.alt_subdir):
-                try:
-                    return resources.files(self.package).joinpath(f"{d}/{name}.txt").read_text(encoding="utf-8")
-                except Exception as e:
-                    last_err = e
-            raise FileNotFoundError(f"template '{name}.txt' not found in {self.package}/prompts or /prompt") from last_err
+[問題]
+{problem}
 
-        def render(self, name: str, vars: Mapping | None = None, *, strict: bool = True) -> str:
-            txt = self._load_text(name)
-            data = dict(vars or {})
-            if strict:
-                return txt.format(**data)
-            class _DDict(dict):
-                def __missing__(self, key): return ""
-            return txt.format_map(_DDict(data))
+[ここまでの推論]
+- {steps}
 
-        def available(self) -> List[str]:
-            names: set[str] = set()
-            for d in ("prompts", "prompt"):
-                try:
-                    for p in resources.files(self.package).joinpath(d).iterdir():
-                        if str(p).endswith(".txt"):
-                            names.add(p.name[:-4])
-                except Exception:
-                    pass
-            return sorted(names)
+# 出力（例）
+- 既出の数量から○○を代入して式を整理する
+- △△の定義により～を置換する
+- 外部情報（公式○○）で事実Xを検証する
+""",
 
-    _store = _LocalStore(package=__package__)
-else:
-    # 共通PromptStoreがある場合（推奨パス）
-    _store = _PS(package=__package__, subdir="prompts")  # subdir='prompts' を明示
+    "cot_judge_ja": """あなたは思考枝の検証者です。
+以下の問題・現在の推論ステップ列・暫定答え（あれば）を読み、整合性・論理一貫性・計算正確性・事実妥当性を総合して 0.0～1.0 の妥当性スコアを付けてください。
 
-# ---- 3) 公開API --------------------------------------------------------------
-def render(name: str, *, vars: Optional[Mapping] = None, strict: bool = True) -> str:
-    """
-    halusearch/prompts/<name>.txt を読み込み、vars を埋め込む。
-    strict=True だと不足キーで KeyError を出して早期に気づけます。
-    """
-    return _store.render(name, vars or {}, strict=strict)
+# 判定基準（減点例）
+- 事実未確認の飛躍: -0.2
+- 内的矛盾/循環参照: -0.3
+- 明確な計算ミス: -0.4
+- 既知事実と衝突: -0.5
+- 重要前提の欠落: -0.2
+※ 不確実なら低めに。根拠が強いほど高得点。
 
-def available_templates() -> List[str]:
-    """利用可能なテンプレート名の一覧（拡張子 .txt を除く）"""
-    if hasattr(_store, "available"):
-        return _store.available()
-    # ここに来ることはほぼ無い想定だが、一応安全側に
-    return []
+# 出力は**1行のみ**： `score=<0.0~1.0>`。説明や余分な文字は禁止。
+
+[問題]
+{problem}
+
+[推論ステップ]
+- {steps}
+
+[暫定答え]
+{answer}
+
+# 出力（厳守）
+score=""",
+}
+
+def render(name: str, **kwargs) -> str:
+    return HALUSEARCH_TEMPLATES[name].format(**kwargs)
+
+# --- （任意）CoTの共通レンダラに登録したい場合 ---
+def register_with_cot_prompts():
+    from relicot.CoT import cot_prompts as CP
+    CP.TEMPLATES.update(HALUSEARCH_TEMPLATES)

@@ -7,13 +7,13 @@ import re
 
 from relicot.CoT.cot_module import CoTGenerator
 from relicot.CoT.cot_parser import parse_all
-from . import prompts as hs_prompts  # ← ここがポイント：ローカルpromptsを使う
+from relicot.CoT import cot_prompts
 
 _NUM01_RE = re.compile(r"(?:^|[^0-9.])([01](?:\.\d+)?)(?:[^0-9.]|$)", re.MULTILINE)
 
 @dataclass(order=True)
 class _Node:
-    # heapqは最小ヒープなので、最後に nlargest で上位だけ残す方式にします
+    # heapq は最小ヒープ。スコア昇順で溜めて、各層の最後に nlargest で上位だけ残す方針。
     score: float
     steps: List[str] = field(compare=False, default_factory=list)
     answer: str = field(compare=False, default="")
@@ -21,12 +21,12 @@ class _Node:
 
 class HaluSearchRunner:
     """
-    LLM-only HaluSearch（安定版）
-    - beam_size: ビーム幅 / branch: 各ノードの展開数 / depth: 深さ
-    - judge: 0..1のスコアのみを返させ、堅牢にパース
-    - expand: 箇条書き/番号/Step n: を正規化して重複除去
-    - answer: 軽いテンプレで steps→最終解 を抽出（崩れたら parse_all フォールバック）
-    - 各プロンプトは halusearch/prompts/*.txt から読み込み（hs_prompts.render）
+    LLM-only 簡易 HaluSearch（安定版）
+    - beam_size: ビーム幅 / branch: 各ノードからの展開数 / depth: 深さ
+    - judge は 0..1 のスコアのみを出させ、しっかりパース & クランプ
+    - expand は箇条書き/番号付き/Step n: を正規化
+    - answer は軽いテンプレに切替（steps から最終解だけを出させる）→ 軽量＆安定
+    - 重複展開の除去、反復の抑制、デバッグ用トレース付き
     """
     def __init__(
         self,
@@ -35,13 +35,13 @@ class HaluSearchRunner:
         beam_size: int = 4,
         branch: int = 3,
         depth: int = 3,
-        judge_tpl: str = "halu_judge_ja",                 # halusearch/prompts/halu_judge_ja.txt
-        expand_tpl: str = "halu_expand_ja",               # halusearch/prompts/halu_expand_ja.txt
-        answer_tpl: str = "halu_answer_from_steps_ja",    # halusearch/prompts/halu_answer_from_steps_ja.txt
-        judge_kwargs: Optional[Dict[str, Any]] = None,
+        judge_tpl: str = "halu_judge_ja",              # CoT/prompts/*.txt に用意
+        expand_tpl: str = "halu_expand_ja",
+        answer_tpl: str = "halu_answer_from_steps_ja",
+        judge_kwargs: Optional[Dict[str, Any]] = None,  # 低温・短尺でOK
         expand_kwargs: Optional[Dict[str, Any]] = None,
         answer_kwargs: Optional[Dict[str, Any]] = None,
-        answer_each_step: bool = False,                   # True: 各層で逐次Answerを推定
+        answer_each_step: bool = False,                 # Trueにすると各層で逐次Answerを推定
     ):
         self.gen = gen
         self.beam_size, self.branch, self.depth = beam_size, branch, depth
@@ -56,37 +56,35 @@ class HaluSearchRunner:
         self.answer_kwargs.update(answer_kwargs or {})
         self.answer_each_step = answer_each_step
 
-    # --------------------- helpers ---------------------
+    # --------------------- private helpers ---------------------
     def _render_steps(self, steps: List[str]) -> str:
+        # 見やすい箇条書き（テンプレ側で {steps_bullets} を使うと便利）
         return "\n- " + "\n- ".join(s.strip() for s in steps) if steps else "(none)"
 
     def _parse_score(self, text: str) -> float:
+        # 0..1 の最初の数値を拾ってクランプ。見つからなければ 0.5
         m = _NUM01_RE.search(text or "")
         val = float(m.group(1)) if m else 0.5
         return max(0.0, min(1.0, val))
 
     def _judge(self, problem: str, steps: List[str], answer: str = "") -> float:
-        prompt = hs_prompts.render(
+        prompt = cot_prompts.render(
             self.judge_tpl,
-            vars={
-                "problem": problem,
-                "steps_bullets": self._render_steps(steps),
-                "steps": "\n".join(steps),
-                "answer": answer,
-            },
+            problem=problem,
+            steps_bullets=self._render_steps(steps),
+            steps="\n".join(steps),
+            answer=answer,
         )
         text = self.gen.generate_raw(prompt, decode_kwargs=self.judge_kwargs)
         return self._parse_score(text)
 
     def _expand(self, problem: str, steps: List[str]) -> List[str]:
-        prompt = hs_prompts.render(
+        prompt = cot_prompts.render(
             self.expand_tpl,
-            vars={
-                "problem": problem,
-                "steps_bullets": self._render_steps(steps),
-                "steps": "\n".join(steps),
-                "k": str(self.branch),
-            },
+            problem=problem,
+            steps_bullets=self._render_steps(steps),
+            steps="\n".join(steps),
+            k=str(self.branch),
         )
         text = self.gen.generate_raw(prompt, decode_kwargs=self.expand_kwargs)
         cands: List[str] = []
@@ -101,26 +99,25 @@ class HaluSearchRunner:
         return cands[: self.branch]
 
     def _answer_from_steps(self, problem: str, steps: List[str]) -> str:
-        prompt = hs_prompts.render(
+        # steps を渡して最終解だけを書かせる軽テンプレ。崩れたら parse_all で補助。
+        prompt = cot_prompts.render(
             self.answer_tpl,
-            vars={
-                "problem": problem,
-                "steps_bullets": self._render_steps(steps),
-                "steps": "\n".join(steps),
-            },
+            problem=problem,
+            steps_bullets=self._render_steps(steps),
+            steps="\n".join(steps),
         )
         text = self.gen.generate_raw(prompt, decode_kwargs=self.answer_kwargs)
         pr = parse_all(text)
         return (pr.answer or "").strip() or text.strip()
 
-    # ----------------------- API -----------------------
+    # ----------------------- public API ------------------------
     def run(self, problem: str, *, sc_k: int = 7) -> Dict[str, Any]:
-        # 初期ビーム
+        # 初期ビーム（空ステップの評価）
         beam: List[_Node] = []
         heapq.heappush(beam, _Node(score=self._judge(problem, []), steps=[], depth=0))
 
         trace: List[List[Dict[str, Any]]] = []
-        visited: Set[Tuple[str, ...]] = set([tuple()])
+        visited: Set[Tuple[str, ...]] = set([tuple()])  # 重複枝の抑制
 
         for d in range(self.depth):
             nxt: List[_Node] = []
@@ -140,18 +137,21 @@ class HaluSearchRunner:
                     s = self._judge(problem, steps2, ans)
                     heapq.heappush(nxt, _Node(score=s, steps=steps2, answer=ans, depth=d + 1))
 
+            # 上位ビームだけを残す
             beam = heapq.nlargest(self.beam_size, nxt)
             trace.append(
                 [{"score": n.score, "steps": list(n.steps), "answer": n.answer} for n in beam]
             )
-            if not beam:
+            if not beam:  # すべて潰れた場合の保険
                 break
 
+        # Self-consistency（最終投票）
         sc = self.gen.run_self_consistency(problem=problem, template="cot_sc_ja", k=sc_k)
+
         best = max(beam, key=lambda n: n.score) if beam else _Node(0.0, [], "")
         return {
             "best": {"steps": best.steps, "answer": best.answer, "score": best.score},
             "majority": sc["answer_majority"],
             "all_answers": sc["answers"],
-            "beam_trace": trace,
+            "beam_trace": trace,  # 各層の上位ビームのトレース
         }
